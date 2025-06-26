@@ -22,28 +22,39 @@ import ExternalAccessory
  */
 class ByteArrayDeviceConnectionImpl : NSObject, DeviceConnection, StreamDelegate {
 
+    // A serial dispatch queue to synchronize access to the inBuffer and outBuffer.
+    private let bufferQueue = DispatchQueue(label: "com.kjd.reactnative.bluetooth.classic.byte.buffer")
+
     /// The delegate to be notified when data is received from the accessory.
     private var _dataReceivedDelegate: DataReceivedDelegate?
     var dataReceivedDelegate: DataReceivedDelegate? {
         set(newDelegate) {
             // When a new delegate is set, we check if there's any data
             // already in the buffer. If so, we deliver it immediately.
-            if let unwrapped = newDelegate {
-                if let data = read() {
-                    unwrapped.onReceivedData(fromDevice: accessory, receivedData: data)
+            var dataToSend: String?
+            bufferQueue.sync {
+                self._dataReceivedDelegate = newDelegate
+                if newDelegate != nil && !self.inBuffer.isEmpty {
+                    dataToSend = self.inBuffer.base64EncodedString()
+                    self.inBuffer.removeAll()
                 }
             }
-            self._dataReceivedDelegate = newDelegate
+            
+            if let data = dataToSend, let delegate = newDelegate {
+                 DispatchQueue.main.async {
+                    delegate.onReceivedData(fromDevice: self.accessory, receivedData: data)
+                }
+            }
         }
         get {
-            return self._dataReceivedDelegate
+            return bufferQueue.sync { self._dataReceivedDelegate }
         }
     }
 
     /// The active EASession for communication with the accessory.
     private var session: EASession?
     
-    /// Buffers for incoming and outgoing data.
+    /// Buffers for incoming and outgoing data. Access must be synchronized via bufferQueue.
     private var inBuffer: Data
     private var outBuffer: Data
 
@@ -128,6 +139,7 @@ class ByteArrayDeviceConnectionImpl : NSObject, DeviceConnection, StreamDelegate
             currentSession.outputStream?.remove(from: .main, forMode: RunLoopMode.defaultRunLoopMode)
         }
         session = nil
+        clear()
     }
 
     /**
@@ -136,7 +148,7 @@ class ByteArrayDeviceConnectionImpl : NSObject, DeviceConnection, StreamDelegate
      * - returns: The number of available bytes.
      */
     func available() -> Int {
-        return inBuffer.count
+        return bufferQueue.sync { inBuffer.count }
     }
 
     /**
@@ -148,7 +160,9 @@ class ByteArrayDeviceConnectionImpl : NSObject, DeviceConnection, StreamDelegate
      */
     func write(_ data: Data) -> Bool {
         NSLog("(ByteArrayDeviceConnection:write) Scheduling %d bytes to write to %@", data.count, accessory.serialNumber)
-        outBuffer.append(data)
+        bufferQueue.async {
+            self.outBuffer.append(data)
+        }
         
         // Trigger an immediate write attempt if the output stream is available.
         if let stream = session?.outputStream, stream.hasSpaceAvailable {
@@ -160,29 +174,33 @@ class ByteArrayDeviceConnectionImpl : NSObject, DeviceConnection, StreamDelegate
 
     /**
      * Reads the entire contents of the input buffer, encodes it as a Base64 string,
-     * and clears the buffer.
+     * and clears the input buffer. This is a thread-safe operation.
      *
      * - returns: A Base64 encoded string of the buffer's contents, or `nil` if the buffer is empty.
      */
     func read() -> String? {
-        if inBuffer.isEmpty {
-            return nil
+        return bufferQueue.sync {
+            if inBuffer.isEmpty {
+                return nil
+            }
+            
+            NSLog("(ByteArrayDeviceConnection:read) Reading %d bytes from device %@", inBuffer.count, accessory.serialNumber)
+
+            let base64String = inBuffer.base64EncodedString()
+            inBuffer.removeAll() // Only clear the input buffer.
+
+            return base64String
         }
-        
-        NSLog("(ByteArrayDeviceConnection:read) Reading %d bytes from device %@", inBuffer.count, accessory.serialNumber)
-
-        let base64String = inBuffer.base64EncodedString()
-        clear() // Note: `read` is a destructive operation.
-
-        return base64String
     }
 
     /**
-     * Clears both the input and output buffers.
+     * Clears both the input and output buffers in a thread-safe manner.
      */
     func clear() {
-        inBuffer.removeAll()
-        outBuffer.removeAll()
+        bufferQueue.async {
+            self.inBuffer.removeAll()
+            self.outBuffer.removeAll()
+        }
     }
 
     /**
@@ -207,7 +225,7 @@ class ByteArrayDeviceConnectionImpl : NSObject, DeviceConnection, StreamDelegate
             }
             break
         case .errorOccurred:
-            NSLog("(ByteArrayDeviceConnection:stream) Error occurred on stream: %@", aStream)
+            NSLog("(ByteArrayDeviceConnection:stream) Error occurred on stream: %@, Error: %@", aStream, aStream.streamError?.localizedDescription ?? "N/A")
             break
         case .endEncountered:
             NSLog("(ByteArrayDeviceConnection:stream) Stream end encountered: %@", aStream)
@@ -219,58 +237,72 @@ class ByteArrayDeviceConnectionImpl : NSObject, DeviceConnection, StreamDelegate
     }
 
     /**
-     * Reads available data from the input stream into the `inBuffer`.
-     * If a data received delegate is registered, the data is immediately
-     * processed and sent to the delegate.
+     * Reads available data from the input stream into the `inBuffer` and notifies the delegate.
+     * This operation is made thread-safe by synchronizing buffer access.
      */
     private func readDataFromStream(_ stream: InputStream) {
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: readSize)
-        
-        // Defer freeing the buffer to ensure it's deallocated.
-        defer {
-            buffer.deallocate()
-        }
+        defer { buffer.deallocate() }
 
+        var dataWasRead = false
         while stream.hasBytesAvailable {
             let bytesRead = stream.read(buffer, maxLength: readSize)
-            if bytesRead < 0, let error = stream.streamError {
-                NSLog("(ByteArrayDeviceConnection:readData) Stream read error: %@", error.localizedDescription)
+            if bytesRead <= 0 {
+                if let error = stream.streamError {
+                     NSLog("(ByteArrayDeviceConnection:readData) Stream read error: %@", error.localizedDescription)
+                }
                 break
             }
             
-            if bytesRead > 0 {
+            bufferQueue.sync {
                 inBuffer.append(buffer, count: bytesRead)
             }
+            dataWasRead = true
         }
         
-        // If a delegate is listening, process the received data immediately.
-        if let delegate = self.dataReceivedDelegate, !inBuffer.isEmpty {
-            if let data = read() { // read() will also clear the buffer
-                delegate.onReceivedData(fromDevice: accessory, receivedData: data)
+        // If a delegate is listening and we read data, process and send it.
+        var dataForDelegate: String?
+        if dataWasRead {
+             bufferQueue.sync {
+                if self._dataReceivedDelegate != nil && !self.inBuffer.isEmpty {
+                    dataForDelegate = self.inBuffer.base64EncodedString()
+                    self.inBuffer.removeAll()
+                }
+             }
+        }
+       
+        if let data = dataForDelegate, let delegate = self.dataReceivedDelegate {
+            DispatchQueue.main.async {
+                delegate.onReceivedData(fromDevice: self.accessory, receivedData: data)
             }
         }
     }
 
     /**
-     * Writes data from the `outBuffer` to the output stream.
+     * Writes data from the `outBuffer` to the output stream. The buffer access and modification
+     * is performed atomically to prevent race conditions.
      */
     private func writeDataToStream(_ stream: OutputStream) {
-        guard !outBuffer.isEmpty else {
-            return
-        }
+        bufferQueue.async {
+            guard !self.outBuffer.isEmpty else {
+                return
+            }
+            
+            let bytesWritten = self.outBuffer.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> Int in
+                let bytesToWrite = min(self.outBuffer.count, self.readSize)
+                guard let baseAddress = ptr.baseAddress else { return 0 }
+                return stream.write(baseAddress.assumingMemoryBound(to: UInt8.self), maxLength: bytesToWrite)
+            }
 
-        let bytesToWrite = min(outBuffer.count, readSize)
-        let dataChunk = outBuffer.prefix(bytesToWrite)
-        
-        let bytesWritten = dataChunk.withUnsafeBytes {
-            stream.write($0.baseAddress!.assumingMemoryBound(to: UInt8.self), maxLength: dataChunk.count)
-        }
-
-        if bytesWritten > 0 {
-            outBuffer.removeFirst(bytesWritten)
-            NSLog("(ByteArrayDeviceConnection:writeData) Wrote %d bytes to stream. %d bytes remaining.", bytesWritten, outBuffer.count)
-        } else if let error = stream.streamError {
-            NSLog("(ByteArrayDeviceConnection:writeData) Stream write error: %@", error.localizedDescription)
+            if bytesWritten > 0 {
+                // This is now safe because the read (withUnsafeBytes) and the write (removeFirst)
+                // happen within the same synchronized block, preventing other threads from
+                // modifying the buffer in between.
+                self.outBuffer.removeFirst(bytesWritten)
+                NSLog("(ByteArrayDeviceConnection:writeData) Wrote %d bytes to stream. %d bytes remaining.", bytesWritten, self.outBuffer.count)
+            } else if let error = stream.streamError {
+                NSLog("(ByteArrayDeviceConnection:writeData) Stream write error: %@", error.localizedDescription)
+            }
         }
     }
 }
