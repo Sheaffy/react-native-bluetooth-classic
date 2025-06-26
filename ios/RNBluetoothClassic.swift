@@ -69,7 +69,7 @@ class RNBluetoothClassic : NSObject, RCTBridgeModule {
             .object(forInfoDictionaryKey: "UISupportedExternalAccessoryProtocols") as! [String]
         
         self.connectionFactories = Dictionary()
-        self.connectionFactories["delimited"] = DelimitedStringDeviceConnectionFactory()
+        self.connectionFactories["binary"] = ByteArrayDeviceConnectionFactory()
         
         self.connections = Dictionary()
         self.listeners = Dictionary()
@@ -263,7 +263,7 @@ class RNBluetoothClassic : NSObject, RCTBridgeModule {
         var connectionOptions = Dictionary<String,Any>()
         connectionOptions.merge(options as! [String : Any]) { $1 }
         
-        let connectionType = connectionOptions["CONNECTION_TYPE"] ?? "delimited";
+        let connectionType = connectionOptions["CONNECTION_TYPE"] ?? "binary";
         guard let factory = connectionFactories[connectionType as! String] else {
             let error = NSError(domain: "kjd.reactnative.bluetooth", code: 200)
             reject("invalid_connection_type", "Invalid connection type", error)
